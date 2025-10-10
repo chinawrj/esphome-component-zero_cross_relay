@@ -265,19 +265,25 @@ void IRAM_ATTR ZeroCrossRelayComponent::gpio_isr_handler(void *arg) {
   gptimer_get_captured_count(component->gptimer_, &hardware_count);
   
   // Then capture software timestamp (when ISR actually started executing)
-  uint32_t current_time = esp_timer_get_time();
+  // IMPORTANT: Must use the SAME timer (GPTimer) for both timestamps!
+  // Using esp_timer would compare different time bases (ERROR!)
+  uint64_t software_count;
+  gptimer_get_raw_count(component->gptimer_, &software_count);
   
   // Calculate ISR latency (difference between hardware trigger and software execution)
-  // Hardware timestamp is captured by ETM at the exact moment GPIO edge occurred
-  // Software timestamp is when this ISR code started running
-  uint64_t software_count = (uint64_t)current_time;
+  // Both timestamps are from the same GPTimer (1MHz = 1μs resolution)
+  // Hardware: captured by ETM at exact GPIO edge moment
+  // Software: read when ISR code started executing
   if (software_count >= hardware_count) {
     component->isr_latency_ns_ = (uint32_t)((software_count - hardware_count) * 1000);
   }
   
-  // Store timestamps for debugging/logging
+  // Store timestamps for debugging/logging (both in microseconds)
   component->hardware_timestamp_ = hardware_count;
   component->software_timestamp_ = software_count;
+  
+  // Get system timestamp for edge timing calculations (use esp_timer for this)
+  uint32_t current_time = esp_timer_get_time();
   
   // ========================================
   // Key: Read GPIO level to determine rising or falling edge
