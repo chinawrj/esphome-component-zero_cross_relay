@@ -26,8 +26,11 @@
 
 // ESP-IDF GPIO interrupt API
 #include "driver/gpio.h"
-#include "driver/gptimer.h"  // Hardware timer for timestamp capture
+#include "driver/gptimer.h"      // Hardware timer for timestamp capture
+#include "driver/gptimer_etm.h"  // GPTimer ETM for capture task
 #include "esp_timer.h"
+#include "esp_etm.h"             // Event Task Matrix for hardware capture
+#include "driver/gpio_etm.h"     // GPIO ETM for edge detection
 
 namespace esphome {
 namespace zero_cross_relay {
@@ -88,7 +91,11 @@ class ZeroCrossRelayComponent : public Component {
   
   // Hardware timestamp capture for ISR latency measurement
   gptimer_handle_t gptimer_{nullptr};          ///< GPTimer handle for hardware timestamp
-  volatile uint64_t hardware_timestamp_{0};    ///< Hardware-captured timestamp (us)
+  esp_etm_channel_handle_t etm_channel_{nullptr};  ///< ETM channel for GPIO->Timer capture
+  esp_etm_event_handle_t gpio_event_{nullptr}; ///< GPIO edge event for ETM
+  esp_etm_task_handle_t timer_task_{nullptr};  ///< Timer capture task for ETM
+  
+  volatile uint64_t hardware_timestamp_{0};    ///< Hardware-captured timestamp (us) by ETM
   volatile uint64_t software_timestamp_{0};    ///< Software ISR entry timestamp (us)
   volatile uint32_t isr_latency_ns_{0};        ///< ISR latency in nanoseconds
   

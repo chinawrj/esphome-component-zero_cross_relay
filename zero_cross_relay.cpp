@@ -39,14 +39,17 @@ void ZeroCrossRelayComponent::setup() {
   this->relay_output_gpio_num_ = static_cast<gpio_num_t>(this->relay_output_pin_->get_pin());
 
   // ========================================
-  // Step 1: Initialize Hardware Timer (GPTimer) for Timestamp Capture
+  // Step 1: Initialize Hardware Timer (GPTimer) with Capture Support
   // ========================================
-  ESP_LOGI(TAG, "Initializing GPTimer for hardware timestamp capture...");
+  ESP_LOGI(TAG, "Initializing GPTimer for hardware timestamp capture via ETM...");
   
   gptimer_config_t timer_config = {
       .clk_src = GPTIMER_CLK_SRC_DEFAULT,
       .direction = GPTIMER_COUNT_UP,
       .resolution_hz = 1000000,  // 1MHz = 1μs resolution
+      .flags = {
+          .intr_shared = false,
+      },
   };
   
   esp_err_t err = gptimer_new_timer(&timer_config, &this->gptimer_);
@@ -73,6 +76,64 @@ void ZeroCrossRelayComponent::setup() {
   }
 
   ESP_LOGI(TAG, "✓ GPTimer initialized and started (1MHz, free-running mode)");
+
+  // ========================================
+  // Step 1.5: Setup ETM (Event Task Matrix) for Hardware Capture
+  // This creates a hardware connection: GPIO edge -> Timer capture
+  // ========================================
+  ESP_LOGI(TAG, "Setting up ETM for hardware timestamp capture...");
+
+  // Create GPIO edge event (triggers on ANY edge)
+  gpio_etm_event_config_t gpio_event_config = {
+      .edge = GPIO_ETM_EVENT_EDGE_ANY,
+  };
+  
+  err = gpio_new_etm_event(&gpio_event_config, &this->gpio_event_, this->zero_cross_gpio_num_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to create GPIO ETM event: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+
+  // Get timer capture task (ETM task that captures timer value)
+  gptimer_etm_task_config_t timer_task_config = {
+      .task_type = GPTIMER_ETM_TASK_CAPTURE,
+  };
+  
+  err = gptimer_new_etm_task(this->gptimer_, &timer_task_config, &this->timer_task_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to create GPTimer ETM task: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+
+  // Allocate ETM channel
+  esp_etm_channel_config_t etm_config = {};
+  err = esp_etm_new_channel(&etm_config, &this->etm_channel_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to create ETM channel: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+
+  // Connect GPIO event to Timer capture task via ETM
+  err = esp_etm_channel_connect(this->etm_channel_, this->gpio_event_, this->timer_task_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to connect ETM channel: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+
+  // Enable the ETM channel
+  err = esp_etm_channel_enable(this->etm_channel_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to enable ETM channel: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+
+  ESP_LOGI(TAG, "✓ ETM channel configured: GPIO%d edge -> GPTimer capture (HARDWARE)", 
+           this->zero_cross_gpio_num_);
 
   // ========================================
   // Step 2 & 3: Use ESP-IDF native GPIO interrupt API
@@ -176,17 +237,15 @@ void ZeroCrossRelayComponent::loop() {
 }
 
 void ZeroCrossRelayComponent::dump_config() {
-  ESP_LOGCONFIG(TAG, "Zero-Cross Detection Solid State Relay (Hardware Timestamp Mode):");
-  LOG_PIN("  Zero-Cross Input Pin: ", this->zero_cross_pin_);
-  LOG_PIN("  Relay Output Pin: ", this->relay_output_pin_);
-  ESP_LOGCONFIG(TAG, "  Interrupt Mode: ANYEDGE (Both Rising & Falling)");
-  ESP_LOGCONFIG(TAG, "  Hardware Timer: GPTimer (1MHz, free-running)");
-  ESP_LOGCONFIG(TAG, "  Total Interrupts: %u", this->trigger_count_);
-  ESP_LOGCONFIG(TAG, "  Complete Pulses: %u", this->pulse_count_);
-  ESP_LOGCONFIG(TAG, "  Pulse Width: %u μs", this->pulse_width_us_);
-  ESP_LOGCONFIG(TAG, "  Pulse Interval: %u μs", this->pulse_interval_us_);
-  ESP_LOGCONFIG(TAG, "  Estimated AC Frequency: %.2f Hz", this->estimated_frequency_);
-  ESP_LOGCONFIG(TAG, "  ISR Latency: %u ns (%.2f μs)", this->isr_latency_ns_, this->isr_latency_ns_ / 1000.0f);
+  ESP_LOGCONFIG(TAG, "Zero Cross Detection Relay:");
+  ESP_LOGCONFIG(TAG, "  Zero-cross detection pin: GPIO%d", this->zero_cross_gpio_num_);
+  ESP_LOGCONFIG(TAG, "  Relay output pin: GPIO%d", this->relay_output_gpio_num_);
+  ESP_LOGCONFIG(TAG, "  Interrupt trigger mode: ANYEDGE (rising + falling)");
+  ESP_LOGCONFIG(TAG, "  Hardware timer: GPTimer @ 1MHz (1μs resolution)");
+  ESP_LOGCONFIG(TAG, "  Hardware capture: ETM (Event Task Matrix)");
+  ESP_LOGCONFIG(TAG, "    ├─ GPIO edge event -> GPTimer capture task");
+  ESP_LOGCONFIG(TAG, "    └─ Zero software overhead for timestamp capture");
+  ESP_LOGCONFIG(TAG, "  ISR allocation: ESP_INTR_FLAG_IRAM (optimized)");
 }
 
 // ========================================
@@ -198,17 +257,19 @@ void IRAM_ATTR ZeroCrossRelayComponent::gpio_isr_handler(void *arg) {
   ZeroCrossRelayComponent *component = static_cast<ZeroCrossRelayComponent *>(arg);
   
   // ========================================
-  // CRITICAL: Capture hardware timestamp FIRST
-  // This is the hardware-recorded timestamp when GPIO interrupt occurred
+  // CRITICAL: Get HARDWARE-CAPTURED timestamp from ETM
+  // The GPIO edge already triggered timer capture via ETM hardware
+  // We just need to read the captured value
   // ========================================
   uint64_t hardware_count;
-  gptimer_get_raw_count(component->gptimer_, &hardware_count);
+  gptimer_get_captured_count(component->gptimer_, &hardware_count);
   
   // Then capture software timestamp (when ISR actually started executing)
   uint32_t current_time = esp_timer_get_time();
   
   // Calculate ISR latency (difference between hardware trigger and software execution)
-  // Both timestamps are in microseconds, convert difference to nanoseconds for precision
+  // Hardware timestamp is captured by ETM at the exact moment GPIO edge occurred
+  // Software timestamp is when this ISR code started running
   uint64_t software_count = (uint64_t)current_time;
   if (software_count >= hardware_count) {
     component->isr_latency_ns_ = (uint32_t)((software_count - hardware_count) * 1000);
