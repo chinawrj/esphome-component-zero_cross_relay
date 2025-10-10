@@ -24,8 +24,9 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
-// ESP-IDF GPIO中断API
+// ESP-IDF GPIO interrupt API
 #include "driver/gpio.h"
+#include "driver/gptimer.h"  // Hardware timer for timestamp capture
 #include "esp_timer.h"
 
 namespace esphome {
@@ -84,6 +85,12 @@ class ZeroCrossRelayComponent : public Component {
   volatile uint32_t pulse_width_us_{0};        ///< Latest pulse width (us) - rising to falling edge time
   volatile uint32_t pulse_interval_us_{0};     ///< Pulse interval (us) - time between two rising edges
   float estimated_frequency_{0.0f};            ///< Estimated AC frequency (Hz) - based on pulse interval
+  
+  // Hardware timestamp capture for ISR latency measurement
+  gptimer_handle_t gptimer_{nullptr};          ///< GPTimer handle for hardware timestamp
+  volatile uint64_t hardware_timestamp_{0};    ///< Hardware-captured timestamp (us)
+  volatile uint64_t software_timestamp_{0};    ///< Software ISR entry timestamp (us)
+  volatile uint32_t isr_latency_ns_{0};        ///< ISR latency in nanoseconds
   
   gpio_num_t zero_cross_gpio_num_;             ///< Zero-cross detection GPIO number (ESP-IDF format)
   gpio_num_t relay_output_gpio_num_;           ///< Relay output GPIO number (ESP-IDF format)

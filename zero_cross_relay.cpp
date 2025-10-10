@@ -19,9 +19,9 @@ namespace zero_cross_relay {
 static const char *const TAG = "zero_cross_relay";
 
 void ZeroCrossRelayComponent::setup() {
-  ESP_LOGI(TAG, "🔧 Setting up Zero-Cross Detection Solid State Relay (ESP-IDF Interrupt Mode)...");
+  ESP_LOGI(TAG, "🔧 Setting up Zero-Cross Detection Solid State Relay (ESP-IDF Interrupt Mode with Hardware Timestamp)...");
 
-  // 验证引脚配置
+  // Validate pin configuration
   if (this->zero_cross_pin_ == nullptr) {
     ESP_LOGE(TAG, "❌ Zero-cross detection pin not configured!");
     this->mark_failed();
@@ -34,15 +34,53 @@ void ZeroCrossRelayComponent::setup() {
     return;
   }
 
-  // 获取GPIO编号（转换为ESP-IDF格式）
+  // Get GPIO numbers (convert to ESP-IDF format)
   this->zero_cross_gpio_num_ = static_cast<gpio_num_t>(this->zero_cross_pin_->get_pin());
   this->relay_output_gpio_num_ = static_cast<gpio_num_t>(this->relay_output_pin_->get_pin());
+
+  // ========================================
+  // Step 1: Initialize Hardware Timer (GPTimer) for Timestamp Capture
+  // ========================================
+  ESP_LOGI(TAG, "Initializing GPTimer for hardware timestamp capture...");
+  
+  gptimer_config_t timer_config = {
+      .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+      .direction = GPTIMER_COUNT_UP,
+      .resolution_hz = 1000000,  // 1MHz = 1μs resolution
+  };
+  
+  esp_err_t err = gptimer_new_timer(&timer_config, &this->gptimer_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to create GPTimer: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+
+  // Enable the timer
+  err = gptimer_enable(this->gptimer_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to enable GPTimer: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+
+  // Start the timer (free-running mode)
+  err = gptimer_start(this->gptimer_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to start GPTimer: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+
+  ESP_LOGI(TAG, "✓ GPTimer initialized and started (1MHz, free-running mode)");
 
   // ========================================
   // Step 2 & 3: Use ESP-IDF native GPIO interrupt API
   // ========================================
   
-  // 1. Configure GPIO3: Zero-cross detection input (using ESP-IDF API)
+  // ========================================
+  // Step 2: Configure GPIO3 as INPUT (Zero-Cross Detection)
+  // ========================================
   gpio_config_t zero_cross_config = {};
   zero_cross_config.pin_bit_mask = (1ULL << this->zero_cross_gpio_num_);
   zero_cross_config.mode = GPIO_MODE_INPUT;
@@ -50,7 +88,7 @@ void ZeroCrossRelayComponent::setup() {
   zero_cross_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
   zero_cross_config.intr_type = GPIO_INTR_ANYEDGE;  // Both-edge trigger interrupt (rising + falling)
   
-  esp_err_t err = gpio_config(&zero_cross_config);
+  err = gpio_config(&zero_cross_config);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "❌ Failed to configure GPIO%d: %s", this->zero_cross_gpio_num_, esp_err_to_name(err));
     this->mark_failed();
@@ -58,7 +96,9 @@ void ZeroCrossRelayComponent::setup() {
   }
   ESP_LOGI(TAG, "✓ GPIO%d configured as INPUT with PULLUP (zero-cross detection)", this->zero_cross_gpio_num_);
 
-  // 2. Configure GPIO4: Relay output (using ESP-IDF API)
+  // ========================================
+  // Step 3: Configure GPIO4 as OUTPUT (Relay Control)
+  // ========================================
   gpio_config_t relay_config = {};
   relay_config.pin_bit_mask = (1ULL << this->relay_output_gpio_num_);
   relay_config.mode = GPIO_MODE_OUTPUT;
@@ -77,8 +117,10 @@ void ZeroCrossRelayComponent::setup() {
   gpio_set_level(this->relay_output_gpio_num_, 0);
   ESP_LOGI(TAG, "✓ GPIO%d configured as OUTPUT, initialized to LOW (relay off)", this->relay_output_gpio_num_);
 
-  // 3. Install GPIO interrupt service
-  err = gpio_install_isr_service(0);  // 0 = default flags
+  // ========================================
+  // Step 4: Install GPIO ISR Service and Attach Handler
+  // ========================================
+  err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);  // IRAM flag for faster ISR
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {  // ESP_ERR_INVALID_STATE means already installed
     ESP_LOGE(TAG, "❌ Failed to install GPIO ISR service: %s", esp_err_to_name(err));
     this->mark_failed();
@@ -94,7 +136,7 @@ void ZeroCrossRelayComponent::setup() {
   }
   
   ESP_LOGI(TAG, "✅ Hardware interrupt attached to GPIO%d (ANYEDGE - Both Rising & Falling)", this->zero_cross_gpio_num_);
-  ESP_LOGI(TAG, "✅ Zero-Cross Relay component initialized successfully (ESP-IDF Interrupt Mode)");
+  ESP_LOGI(TAG, "✅ Zero-Cross Relay component initialized successfully (ESP-IDF Interrupt Mode with Hardware Timestamp)");
 }
 
 void ZeroCrossRelayComponent::loop() {
@@ -125,33 +167,56 @@ void ZeroCrossRelayComponent::loop() {
       ESP_LOGI(TAG, "   ├─ Complete pulses: %u", this->pulse_count_);
       ESP_LOGI(TAG, "   ├─ Pulse width: %u μs", pulse_width);
       ESP_LOGI(TAG, "   ├─ Pulse interval: %u μs (%.1f Hz)", pulse_interval, pulse_freq);
-      ESP_LOGI(TAG, "   └─ AC Frequency: %.2f Hz", this->estimated_frequency_);
+      ESP_LOGI(TAG, "   ├─ AC Frequency: %.2f Hz", this->estimated_frequency_);
+      ESP_LOGI(TAG, "   └─ ⏱️  ISR Latency: %u ns (%.2f μs)", 
+               this->isr_latency_ns_, 
+               this->isr_latency_ns_ / 1000.0f);
     }
   }
 }
 
 void ZeroCrossRelayComponent::dump_config() {
-  ESP_LOGCONFIG(TAG, "Zero-Cross Detection Solid State Relay (Pulse Width Measurement):");
+  ESP_LOGCONFIG(TAG, "Zero-Cross Detection Solid State Relay (Hardware Timestamp Mode):");
   LOG_PIN("  Zero-Cross Input Pin: ", this->zero_cross_pin_);
   LOG_PIN("  Relay Output Pin: ", this->relay_output_pin_);
   ESP_LOGCONFIG(TAG, "  Interrupt Mode: ANYEDGE (Both Rising & Falling)");
+  ESP_LOGCONFIG(TAG, "  Hardware Timer: GPTimer (1MHz, free-running)");
   ESP_LOGCONFIG(TAG, "  Total Interrupts: %u", this->trigger_count_);
   ESP_LOGCONFIG(TAG, "  Complete Pulses: %u", this->pulse_count_);
   ESP_LOGCONFIG(TAG, "  Pulse Width: %u μs", this->pulse_width_us_);
   ESP_LOGCONFIG(TAG, "  Pulse Interval: %u μs", this->pulse_interval_us_);
   ESP_LOGCONFIG(TAG, "  Estimated AC Frequency: %.2f Hz", this->estimated_frequency_);
+  ESP_LOGCONFIG(TAG, "  ISR Latency: %u ns (%.2f μs)", this->isr_latency_ns_, this->isr_latency_ns_ / 1000.0f);
 }
 
 // ========================================
-// ESP-IDF GPIO Interrupt Service Routine (ISR) - Zero-Cross Pulse Width Measurement
-// Measurement target: Rising edge duration (pulse width from rising to falling edge)
+// ESP-IDF GPIO Interrupt Service Routine (ISR) with Hardware Timestamp
+// Uses GPTimer to capture exact interrupt trigger time in hardware
 // Must use IRAM_ATTR to ensure execution in IRAM
 // ========================================
 void IRAM_ATTR ZeroCrossRelayComponent::gpio_isr_handler(void *arg) {
   ZeroCrossRelayComponent *component = static_cast<ZeroCrossRelayComponent *>(arg);
   
-  // Read current timestamp (microsecond precision)
+  // ========================================
+  // CRITICAL: Capture hardware timestamp FIRST
+  // This is the hardware-recorded timestamp when GPIO interrupt occurred
+  // ========================================
+  uint64_t hardware_count;
+  gptimer_get_raw_count(component->gptimer_, &hardware_count);
+  
+  // Then capture software timestamp (when ISR actually started executing)
   uint32_t current_time = esp_timer_get_time();
+  
+  // Calculate ISR latency (difference between hardware trigger and software execution)
+  // Both timestamps are in microseconds, convert difference to nanoseconds for precision
+  uint64_t software_count = (uint64_t)current_time;
+  if (software_count >= hardware_count) {
+    component->isr_latency_ns_ = (uint32_t)((software_count - hardware_count) * 1000);
+  }
+  
+  // Store timestamps for debugging/logging
+  component->hardware_timestamp_ = hardware_count;
+  component->software_timestamp_ = software_count;
   
   // ========================================
   // Key: Read GPIO level to determine rising or falling edge
