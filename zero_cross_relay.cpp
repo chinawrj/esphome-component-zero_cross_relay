@@ -1,9 +1,15 @@
 /**
  * @file zero_cross_relay.cpp
- * @brief Zero-Cross Detection Solid State Relay Component Implementation (ESP-IDF Hardware Interrupt Version)
+ * @brief Zero-Cross Detection Solid State Relay Component Implementation (ESP-IDF PCNT + CPU Interrupt Version)
+ * 
+ * Implementation Details:
+ * - PCNT Unit: Counts GPIO3 rising edges from 0 to 20 (auto-clear at 20)
+ * - Watch Point 1: Count = 10 → Pull GPIO4 LOW (turn off relay)
+ * - Watch Point 2: Count = 20 → Pull GPIO4 HIGH (turn on relay) + Clear count
+ * - Interrupt Callback: PCNT on_reach event triggers ISR for GPIO control
  * 
  * @author chinawrj@gmail.com
- * @date 2025-10-10
+ * @date 2025-10-11
  */
 
 #include "zero_cross_relay.h"
@@ -18,8 +24,20 @@ namespace zero_cross_relay {
 
 static const char *const TAG = "zero_cross_relay";
 
+// PCNT Configuration Constants
+// Note: ESP-IDF PCNT requires symmetric limit range or low_limit < 0
+// We use -20 to +20 range, but only count up from 0, watch at 10 and 20
+#define PCNT_LOW_LIMIT      -20   // Must be negative for ESP-IDF PCNT
+#define PCNT_HIGH_LIMIT     20    // Positive limit
+#define PCNT_WATCH_POINT_HALF   10
+#define PCNT_GLITCH_FILTER_NS   1000  // 1us glitch filter (adjust based on signal quality)
+
+// GPTimer Configuration Constants
+#define TIMER_DELAY_US      2000  // 2000us (2ms) delay after PCNT interrupt
+#define TIMER_RESOLUTION_HZ 1000000  // 1MHz timer resolution (1us per tick)
+
 void ZeroCrossRelayComponent::setup() {
-  ESP_LOGI(TAG, "🔧 Setting up Zero-Cross Detection Solid State Relay (ESP-IDF Interrupt Mode with Hardware Timestamp)...");
+  ESP_LOGI(TAG, "🔧 Setting up Zero-Cross Detection Solid State Relay (ESP-IDF PCNT + CPU Interrupt Mode)...");
 
   // Validate pin configuration
   if (this->zero_cross_pin_ == nullptr) {
@@ -39,127 +57,10 @@ void ZeroCrossRelayComponent::setup() {
   this->relay_output_gpio_num_ = static_cast<gpio_num_t>(this->relay_output_pin_->get_pin());
 
   // ========================================
-  // Step 1: Initialize Hardware Timer (GPTimer) with Capture Support
+  // Step 1: Configure GPIO4 as OUTPUT (Relay Control) - Initialize FIRST
   // ========================================
-  ESP_LOGI(TAG, "Initializing GPTimer for hardware timestamp capture via ETM...");
+  ESP_LOGI(TAG, "Step 1: Configuring GPIO%d as OUTPUT (relay control)...", this->relay_output_gpio_num_);
   
-  gptimer_config_t timer_config = {
-      .clk_src = GPTIMER_CLK_SRC_DEFAULT,
-      .direction = GPTIMER_COUNT_UP,
-      .resolution_hz = 1000000,  // 1MHz = 1μs resolution
-      .flags = {
-          .intr_shared = false,
-      },
-  };
-  
-  esp_err_t err = gptimer_new_timer(&timer_config, &this->gptimer_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "❌ Failed to create GPTimer: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
-  }
-
-  // Enable the timer
-  err = gptimer_enable(this->gptimer_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "❌ Failed to enable GPTimer: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
-  }
-
-  // Start the timer (free-running mode)
-  err = gptimer_start(this->gptimer_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "❌ Failed to start GPTimer: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
-  }
-
-  ESP_LOGI(TAG, "✓ GPTimer initialized and started (1MHz, free-running mode)");
-
-  // ========================================
-  // Step 1.5: Setup ETM (Event Task Matrix) for Hardware Capture
-  // This creates a hardware connection: GPIO edge -> Timer capture
-  // ========================================
-  ESP_LOGI(TAG, "Setting up ETM for hardware timestamp capture...");
-
-  // Create GPIO edge event (triggers on ANY edge)
-  gpio_etm_event_config_t gpio_event_config = {
-      .edge = GPIO_ETM_EVENT_EDGE_ANY,
-  };
-  
-  err = gpio_new_etm_event(&gpio_event_config, &this->gpio_event_, this->zero_cross_gpio_num_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "❌ Failed to create GPIO ETM event: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
-  }
-
-  // Get timer capture task (ETM task that captures timer value)
-  gptimer_etm_task_config_t timer_task_config = {
-      .task_type = GPTIMER_ETM_TASK_CAPTURE,
-  };
-  
-  err = gptimer_new_etm_task(this->gptimer_, &timer_task_config, &this->timer_task_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "❌ Failed to create GPTimer ETM task: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
-  }
-
-  // Allocate ETM channel
-  esp_etm_channel_config_t etm_config = {};
-  err = esp_etm_new_channel(&etm_config, &this->etm_channel_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "❌ Failed to create ETM channel: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
-  }
-
-  // Connect GPIO event to Timer capture task via ETM
-  err = esp_etm_channel_connect(this->etm_channel_, this->gpio_event_, this->timer_task_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "❌ Failed to connect ETM channel: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
-  }
-
-  // Enable the ETM channel
-  err = esp_etm_channel_enable(this->etm_channel_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "❌ Failed to enable ETM channel: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
-  }
-
-  ESP_LOGI(TAG, "✓ ETM channel configured: GPIO%d edge -> GPTimer capture (HARDWARE)", 
-           this->zero_cross_gpio_num_);
-
-  // ========================================
-  // Step 2 & 3: Use ESP-IDF native GPIO interrupt API
-  // ========================================
-  
-  // ========================================
-  // Step 2: Configure GPIO3 as INPUT (Zero-Cross Detection)
-  // ========================================
-  gpio_config_t zero_cross_config = {};
-  zero_cross_config.pin_bit_mask = (1ULL << this->zero_cross_gpio_num_);
-  zero_cross_config.mode = GPIO_MODE_INPUT;
-  zero_cross_config.pull_up_en = GPIO_PULLUP_ENABLE;
-  zero_cross_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
-  zero_cross_config.intr_type = GPIO_INTR_ANYEDGE;  // Both-edge trigger interrupt (rising + falling)
-  
-  err = gpio_config(&zero_cross_config);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "❌ Failed to configure GPIO%d: %s", this->zero_cross_gpio_num_, esp_err_to_name(err));
-    this->mark_failed();
-    return;
-  }
-  ESP_LOGI(TAG, "✓ GPIO%d configured as INPUT with PULLUP (zero-cross detection)", this->zero_cross_gpio_num_);
-
-  // ========================================
-  // Step 3: Configure GPIO4 as OUTPUT (Relay Control)
-  // ========================================
   gpio_config_t relay_config = {};
   relay_config.pin_bit_mask = (1ULL << this->relay_output_gpio_num_);
   relay_config.mode = GPIO_MODE_OUTPUT;
@@ -167,189 +68,390 @@ void ZeroCrossRelayComponent::setup() {
   relay_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
   relay_config.intr_type = GPIO_INTR_DISABLE;
   
-  err = gpio_config(&relay_config);
+  esp_err_t err = gpio_config(&relay_config);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "❌ Failed to configure GPIO%d: %s", this->relay_output_gpio_num_, esp_err_to_name(err));
     this->mark_failed();
     return;
   }
   
-  // Initialize to LOW (relay off)
-  gpio_set_level(this->relay_output_gpio_num_, 0);
-  ESP_LOGI(TAG, "✓ GPIO%d configured as OUTPUT, initialized to LOW (relay off)", this->relay_output_gpio_num_);
+  // Initialize to HIGH (relay on at start, will be controlled by PCNT)
+  gpio_set_level(this->relay_output_gpio_num_, 1);
+  ESP_LOGI(TAG, "✓ GPIO%d configured as OUTPUT, initialized to HIGH (initial state)", this->relay_output_gpio_num_);
 
   // ========================================
-  // Step 4: Install GPIO ISR Service and Attach Handler
+  // Step 2: Configure GPIO3 as INPUT (for PCNT edge counting)
   // ========================================
-  err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);  // IRAM flag for faster ISR
-  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {  // ESP_ERR_INVALID_STATE means already installed
-    ESP_LOGE(TAG, "❌ Failed to install GPIO ISR service: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
-  }
+  ESP_LOGI(TAG, "Step 2: Configuring GPIO%d as INPUT (zero-cross detection for PCNT)...", this->zero_cross_gpio_num_);
   
-  // 4. Register interrupt handler function
-  err = gpio_isr_handler_add(this->zero_cross_gpio_num_, gpio_isr_handler, (void *)this);
+  gpio_config_t input_config = {};
+  input_config.pin_bit_mask = (1ULL << this->zero_cross_gpio_num_);
+  input_config.mode = GPIO_MODE_INPUT;
+  input_config.pull_up_en = GPIO_PULLUP_ENABLE;  // Enable pull-up (adjust based on your circuit)
+  input_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  input_config.intr_type = GPIO_INTR_DISABLE;    // PCNT handles edge detection, not GPIO interrupt
+  
+  err = gpio_config(&input_config);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "❌ Failed to add ISR handler for GPIO%d: %s", this->zero_cross_gpio_num_, esp_err_to_name(err));
+    ESP_LOGE(TAG, "❌ Failed to configure GPIO%d: %s", this->zero_cross_gpio_num_, esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  ESP_LOGI(TAG, "✓ GPIO%d configured as INPUT with PULLUP", this->zero_cross_gpio_num_);
+
+  // ========================================
+  // Step 3: Create and Configure PCNT Unit
+  // ========================================
+  ESP_LOGI(TAG, "Step 3: Creating PCNT unit (count range: 0-%d)...", PCNT_HIGH_LIMIT);
+  
+  pcnt_unit_config_t unit_config = {
+      .low_limit = PCNT_LOW_LIMIT,
+      .high_limit = PCNT_HIGH_LIMIT,
+      .flags = {},
+  };
+  
+  err = pcnt_new_unit(&unit_config, &this->pcnt_unit_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to create PCNT unit: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  ESP_LOGI(TAG, "✓ PCNT unit created (low=%d, high=%d)", PCNT_LOW_LIMIT, PCNT_HIGH_LIMIT);
+
+  // ========================================
+  // Step 4: Configure Glitch Filter (optional but recommended)
+  // ========================================
+  ESP_LOGI(TAG, "Step 4: Configuring glitch filter (%d ns)...", PCNT_GLITCH_FILTER_NS);
+  
+  pcnt_glitch_filter_config_t filter_config = {
+      .max_glitch_ns = PCNT_GLITCH_FILTER_NS,
+  };
+  
+  err = pcnt_unit_set_glitch_filter(this->pcnt_unit_, &filter_config);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to set glitch filter: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  ESP_LOGI(TAG, "✓ Glitch filter configured (%d ns)", PCNT_GLITCH_FILTER_NS);
+
+  // ========================================
+  // Step 5: Create PCNT Channel and Set Edge Action
+  // ========================================
+  ESP_LOGI(TAG, "Step 5: Creating PCNT channel for GPIO%d...", this->zero_cross_gpio_num_);
+  
+  pcnt_chan_config_t channel_config = {
+      .edge_gpio_num = this->zero_cross_gpio_num_,
+      .level_gpio_num = -1,  // No level control GPIO
+      .flags = {},
+  };
+  
+  err = pcnt_new_channel(this->pcnt_unit_, &channel_config, &this->pcnt_channel_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to create PCNT channel: %s", esp_err_to_name(err));
     this->mark_failed();
     return;
   }
   
-  ESP_LOGI(TAG, "✅ Hardware interrupt attached to GPIO%d (ANYEDGE - Both Rising & Falling)", this->zero_cross_gpio_num_);
-  ESP_LOGI(TAG, "✅ Zero-Cross Relay component initialized successfully (ESP-IDF Interrupt Mode with Hardware Timestamp)");
+  // Set edge action: Rising edge INCREASE, Falling edge HOLD
+  err = pcnt_channel_set_edge_action(this->pcnt_channel_,
+                                     PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+                                     PCNT_CHANNEL_EDGE_ACTION_HOLD);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to set edge action: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  ESP_LOGI(TAG, "✓ PCNT channel created (GPIO%d: rising↑ +1, falling↓ hold)", this->zero_cross_gpio_num_);
+
+  // ========================================
+  // Step 6: Add Watch Points (10 and 20)
+  // ========================================
+  ESP_LOGI(TAG, "Step 6: Adding watch points (%d and %d)...", PCNT_WATCH_POINT_HALF, PCNT_HIGH_LIMIT);
+  
+  err = pcnt_unit_add_watch_point(this->pcnt_unit_, PCNT_WATCH_POINT_HALF);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to add watch point %d: %s", PCNT_WATCH_POINT_HALF, esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  
+  err = pcnt_unit_add_watch_point(this->pcnt_unit_, PCNT_HIGH_LIMIT);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to add watch point %d: %s", PCNT_HIGH_LIMIT, esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  ESP_LOGI(TAG, "✓ Watch points added: %d (GPIO4→LOW), %d (GPIO4→HIGH+clear)", 
+           PCNT_WATCH_POINT_HALF, PCNT_HIGH_LIMIT);
+
+  // ========================================
+  // Step 7: Register Event Callback
+  // ========================================
+  ESP_LOGI(TAG, "Step 7: Registering PCNT event callback...");
+  
+  pcnt_event_callbacks_t callbacks = {
+      .on_reach = pcnt_on_reach_callback,
+  };
+  
+  err = pcnt_unit_register_event_callbacks(this->pcnt_unit_, &callbacks, (void *)this);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to register event callbacks: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  ESP_LOGI(TAG, "✓ Event callback registered (on_reach ISR)");
+
+  // ========================================
+  // Step 8: Enable and Start PCNT Unit
+  // ========================================
+  ESP_LOGI(TAG, "Step 8: Enabling and starting PCNT unit...");
+  
+  err = pcnt_unit_enable(this->pcnt_unit_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to enable PCNT unit: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  
+  err = pcnt_unit_clear_count(this->pcnt_unit_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to clear PCNT count: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  
+  err = pcnt_unit_start(this->pcnt_unit_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to start PCNT unit: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  
+  ESP_LOGI(TAG, "✓ PCNT unit enabled and started (counting from 0)");
+
+  // ========================================
+  // Step 9: Create and Configure GPTimer for Delayed GPIO Control
+  // ========================================
+  ESP_LOGI(TAG, "Step 9: Creating GPTimer for %dus delay...", TIMER_DELAY_US);
+  
+  gptimer_config_t timer_config = {
+      .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+      .direction = GPTIMER_COUNT_UP,
+      .resolution_hz = TIMER_RESOLUTION_HZ,  // 1MHz = 1us per tick
+      .flags = {
+          .intr_shared = false,
+      },
+  };
+  
+  err = gptimer_new_timer(&timer_config, &this->delay_timer_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to create GPTimer: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  
+  // Configure timer alarm (one-shot mode, will be restarted in PCNT ISR)
+  gptimer_alarm_config_t alarm_config = {
+      .alarm_count = TIMER_DELAY_US,  // Alarm at 2000us
+      .reload_count = 0,              // Reload to 0
+      .flags = {
+          .auto_reload_on_alarm = false,  // One-shot mode (manual restart)
+      },
+  };
+  
+  err = gptimer_set_alarm_action(this->delay_timer_, &alarm_config);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to set timer alarm: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  
+  // Register timer alarm callback
+  gptimer_event_callbacks_t timer_callbacks = {
+      .on_alarm = timer_alarm_callback,
+  };
+  
+  err = gptimer_register_event_callbacks(this->delay_timer_, &timer_callbacks, (void *)this);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to register timer callbacks: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  
+  // Enable timer (but don't start yet - will be started by PCNT ISR)
+  err = gptimer_enable(this->delay_timer_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Failed to enable GPTimer: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  
+  ESP_LOGI(TAG, "✓ GPTimer configured (one-shot, %dus delay)", TIMER_DELAY_US);
+  
+  ESP_LOGI(TAG, "");
+  ESP_LOGI(TAG, "✅ Zero-Cross Relay initialized successfully!");
+  ESP_LOGI(TAG, "   ├─ Input: GPIO%d (rising edge counts)", this->zero_cross_gpio_num_);
+  ESP_LOGI(TAG, "   ├─ Output: GPIO%d (controlled via delayed timer)", this->relay_output_gpio_num_);
+  ESP_LOGI(TAG, "   ├─ Count range: %d-%d (auto-clear at %d)", 
+           PCNT_LOW_LIMIT, PCNT_HIGH_LIMIT, PCNT_HIGH_LIMIT);
+  ESP_LOGI(TAG, "   ├─ Watch point 1: Count=%d → Start timer → %dus → GPIO4 LOW", 
+           PCNT_WATCH_POINT_HALF, TIMER_DELAY_US);
+  ESP_LOGI(TAG, "   └─ Watch point 2: Count=%d → Start timer → %dus → GPIO4 HIGH + clear", 
+           PCNT_HIGH_LIMIT, TIMER_DELAY_US);
 }
 
 void ZeroCrossRelayComponent::loop() {
   // ========================================
-  // Step 5: Frequency calculation and log output (in main loop)
+  // Periodic status logging (every 5 seconds)
   // ========================================
   
-  // Calculate frequency (based on pulse interval measured by ISR)
   static uint32_t last_log_time = 0;
   uint32_t current_time = millis();
   
-  // Output statistics once per second
-  if (current_time - last_log_time > 1000) {
+  // Output statistics every 5 seconds
+  if (current_time - last_log_time > 5000) {
     last_log_time = current_time;
     
-    // Get latest measurement data from ISR (atomic read)
-    uint32_t pulse_width = this->pulse_width_us_;
-    uint32_t pulse_interval = this->pulse_interval_us_;
+    // Read current PCNT count
+    int pcnt_count = 0;
+    esp_err_t err = pcnt_unit_get_count(this->pcnt_unit_, &pcnt_count);
     
-    if (pulse_interval > 0) {
-      // Zero-cross pulse frequency (e.g., 50Hz AC generates 100Hz pulses)
-      float pulse_freq = 1000000.0f / pulse_interval;
-      // AC frequency = pulse frequency / 2 (because one AC cycle has 2 zero-cross points)
-      this->estimated_frequency_ = pulse_freq / 2.0f;
+    if (err == ESP_OK) {
+      // Get cycle statistics from ISR (atomic read)
+      uint32_t total_triggers = this->trigger_count_;
+      uint32_t total_cycles = this->cycle_count_;
       
-      ESP_LOGI(TAG, "📊 Zero-cross pulse statistics:");
-      ESP_LOGI(TAG, "   ├─ Total interrupts: %u", this->trigger_count_);
-      ESP_LOGI(TAG, "   ├─ Complete pulses: %u", this->pulse_count_);
-      ESP_LOGI(TAG, "   ├─ Pulse width: %u μs", pulse_width);
-      ESP_LOGI(TAG, "   ├─ Pulse interval: %u μs (%.1f Hz)", pulse_interval, pulse_freq);
-      ESP_LOGI(TAG, "   ├─ AC Frequency: %.2f Hz", this->estimated_frequency_);
-      ESP_LOGI(TAG, "   └─ ⏱️  ISR Latency: %u ns (%.2f μs)", 
-               this->isr_latency_ns_, 
-               this->isr_latency_ns_ / 1000.0f);
+      // Calculate cycle time if we have at least one complete cycle
+      float cycle_time_ms = 0.0f;
+      if (total_cycles > 1 && this->last_cycle_time_ > 0) {
+        // Get cycle time in milliseconds (us → ms)
+        cycle_time_ms = (float)this->last_cycle_time_ / 1000.0f;
+        
+        // Calculate estimated AC frequency
+        // Logic:
+        // - 20 zero-cross pulses per cycle (PCNT counts 0→20)
+        // - For 50Hz AC: 100 zero-cross points/second
+        // - So 20 pulses = 20/100 = 0.2 seconds = 200ms
+        // - Frequency = (20 pulses) / (cycle_time_seconds) / 2
+        // - Formula: freq = 20 / (cycle_time_ms / 1000) / 2 = 10000 / cycle_time_ms
+        if (cycle_time_ms > 0) {
+          this->estimated_frequency_ = 10000.0f / cycle_time_ms;
+        }
+      }
+      
+      ESP_LOGI(TAG, "📊 PCNT Zero-Cross Statistics:");
+      ESP_LOGI(TAG, "   ├─ Current count: %d / %d", pcnt_count, PCNT_HIGH_LIMIT);
+      ESP_LOGI(TAG, "   ├─ Total watch point triggers: %u", total_triggers);
+      ESP_LOGI(TAG, "   ├─ Complete cycles (20-count): %u", total_cycles);
+      if (cycle_time_ms > 0) {
+        ESP_LOGI(TAG, "   ├─ Last cycle time: %.2f ms", cycle_time_ms);
+        ESP_LOGI(TAG, "   └─ Estimated AC frequency: %.2f Hz", this->estimated_frequency_);
+      } else {
+        ESP_LOGI(TAG, "   └─ (Waiting for first complete cycle...)");
+      }
     }
   }
 }
 
 void ZeroCrossRelayComponent::dump_config() {
-  ESP_LOGCONFIG(TAG, "Zero Cross Detection Relay:");
-  ESP_LOGCONFIG(TAG, "  Zero-cross detection pin: GPIO%d", this->zero_cross_gpio_num_);
-  ESP_LOGCONFIG(TAG, "  Relay output pin: GPIO%d", this->relay_output_gpio_num_);
-  ESP_LOGCONFIG(TAG, "  Interrupt trigger mode: ANYEDGE (rising + falling)");
-  ESP_LOGCONFIG(TAG, "  Hardware timer: GPTimer @ 1MHz (1μs resolution)");
-  ESP_LOGCONFIG(TAG, "  Hardware capture: ETM (Event Task Matrix)");
-  ESP_LOGCONFIG(TAG, "    ├─ GPIO edge event -> GPTimer capture task");
-  ESP_LOGCONFIG(TAG, "    └─ Zero software overhead for timestamp capture");
-  ESP_LOGCONFIG(TAG, "  ISR allocation: ESP_INTR_FLAG_IRAM (optimized)");
+  ESP_LOGCONFIG(TAG, "Zero Cross Detection Relay (PCNT Mode):");
+  ESP_LOGCONFIG(TAG, "  Zero-cross input: GPIO%d (PCNT edge counting)", this->zero_cross_gpio_num_);
+  ESP_LOGCONFIG(TAG, "  Relay output: GPIO%d (controlled by PCNT watch points)", this->relay_output_gpio_num_);
+  ESP_LOGCONFIG(TAG, "  Count range: %d - %d (auto-clear at %d)", 
+                PCNT_LOW_LIMIT, PCNT_HIGH_LIMIT, PCNT_HIGH_LIMIT);
+  ESP_LOGCONFIG(TAG, "  Watch points:");
+  ESP_LOGCONFIG(TAG, "    ├─ Point 1: Count=%d → GPIO%d LOW (relay off)", 
+                PCNT_WATCH_POINT_HALF, this->relay_output_gpio_num_);
+  ESP_LOGCONFIG(TAG, "    └─ Point 2: Count=%d → GPIO%d HIGH (relay on) + clear count", 
+                PCNT_HIGH_LIMIT, this->relay_output_gpio_num_);
+  ESP_LOGCONFIG(TAG, "  Edge action: Rising edge +1, Falling edge HOLD");
+  ESP_LOGCONFIG(TAG, "  Glitch filter: %d ns", PCNT_GLITCH_FILTER_NS);
 }
 
 // ========================================
-// ESP-IDF GPIO Interrupt Service Routine (ISR) with Hardware Timestamp
-// Uses GPTimer to capture exact interrupt trigger time in hardware
+// PCNT Watch Point Interrupt Callback (ISR Context)
+// Triggered when PCNT count reaches watch points (10 or 20)
+// Does NOT directly control GPIO - instead starts hardware timer for delayed control
 // Must use IRAM_ATTR to ensure execution in IRAM
 // ========================================
-void IRAM_ATTR ZeroCrossRelayComponent::gpio_isr_handler(void *arg) {
-  ZeroCrossRelayComponent *component = static_cast<ZeroCrossRelayComponent *>(arg);
+bool IRAM_ATTR ZeroCrossRelayComponent::pcnt_on_reach_callback(pcnt_unit_handle_t unit,
+                                                               const pcnt_watch_event_data_t *edata,
+                                                               void *user_ctx) {
+  ZeroCrossRelayComponent *component = static_cast<ZeroCrossRelayComponent *>(user_ctx);
   
-  // ========================================
-  // CRITICAL: Get HARDWARE-CAPTURED timestamp from ETM
-  // The GPIO edge already triggered timer capture via ETM hardware
-  // We just need to read the captured value
-  // ========================================
-  uint64_t hardware_count;
-  gptimer_get_captured_count(component->gptimer_, &hardware_count);
-  
-  // Then capture software timestamp (when ISR actually started executing)
-  // IMPORTANT: Must use the SAME timer (GPTimer) for both timestamps!
-  // Using esp_timer would compare different time bases (ERROR!)
-  uint64_t software_count;
-  gptimer_get_raw_count(component->gptimer_, &software_count);
-  
-  // Calculate ISR latency (difference between hardware trigger and software execution)
-  // Both timestamps are from the same GPTimer (1MHz = 1μs resolution)
-  // Hardware: captured by ETM at exact GPIO edge moment
-  // Software: read when ISR code started executing
-  if (software_count >= hardware_count) {
-    component->isr_latency_ns_ = (uint32_t)((software_count - hardware_count) * 1000);
-  }
-  
-  // Store timestamps for debugging/logging (both in microseconds)
-  component->hardware_timestamp_ = hardware_count;
-  component->software_timestamp_ = software_count;
-  
-  // Get system timestamp for edge timing calculations (use esp_timer for this)
-  uint32_t current_time = esp_timer_get_time();
-  
-  // ========================================
-  // Key: Read GPIO level to determine rising or falling edge
-  // ========================================
-  int gpio_level = gpio_get_level(component->zero_cross_gpio_num_);
+  int watch_point_value = edata->watch_point_value;
   
   // Increment total trigger counter
   component->trigger_count_++;
   
-  if (gpio_level == 1) {
+  if (watch_point_value == PCNT_WATCH_POINT_HALF) {
     // ========================================
-    // Rising edge trigger (0→1) - Zero-cross pulse start
+    // Watch Point 1: Count = 10
+    // Set pending GPIO level to LOW, then start timer
     // ========================================
+    component->pending_gpio_level_ = 0;  // Prepare to set GPIO LOW
     
-    // 1. Output HIGH to GPIO4 (solid state relay ON)
-    gpio_set_level(component->relay_output_gpio_num_, 1);
+    // Start one-shot timer (will fire after 2000us)
+    gptimer_set_raw_count(component->delay_timer_, 0);  // Reset timer count to 0
+    gptimer_start(component->delay_timer_);             // Start timer
     
-    // 2. Calculate pulse interval (time between two consecutive rising edges)
-    //    This interval reflects the zero-cross detection frequency
-    //    For 50Hz AC, should be 10ms (100Hz pulse frequency)
-    if (component->last_rising_time_ > 0) {
-      uint32_t interval = current_time - component->last_rising_time_;
-      
-      // Valid range check:
-      // - 50Hz AC → 100Hz pulse → 10000us interval
-      // - 60Hz AC → 120Hz pulse → 8333us interval
-      // - Allowed range: 40-70Hz AC → 7143us-12500us pulse interval
-      if (interval > 7000 && interval < 13000) {
-        component->pulse_interval_us_ = interval;
-      }
+  } else if (watch_point_value == PCNT_HIGH_LIMIT) {
+    // ========================================
+    // Watch Point 2: Count = 20
+    // Set pending GPIO level to HIGH, then start timer
+    // ========================================
+    component->pending_gpio_level_ = 1;  // Prepare to set GPIO HIGH
+    
+    // Record cycle completion time (for frequency calculation)
+    uint32_t current_time = esp_timer_get_time();
+    static uint32_t last_timestamp = 0;  // Static variable to store last cycle timestamp
+    
+    if (last_timestamp > 0) {
+      // Calculate time elapsed for this 20-count cycle (in microseconds)
+      component->last_cycle_time_ = current_time - last_timestamp;
     }
     
-    // 3. Record rising edge timestamp (for subsequent pulse width calculation)
-    component->last_rising_time_ = current_time;
+    // Update timestamp for next cycle
+    last_timestamp = current_time;
     
-  } else {
-    // ========================================
-    // Falling edge trigger (1→0) - Zero-cross pulse end
-    // ========================================
+    // Increment cycle counter
+    component->cycle_count_++;
     
-    // 1. Calculate pulse width (duration from rising to falling edge)
-    //    This is the core data you requested to measure
-    if (component->last_rising_time_ > 0) {
-      uint32_t pulse_width = current_time - component->last_rising_time_;
-      
-      // Validity check: Zero-cross pulse width is typically from a few to a few hundred microseconds
-      // Should not exceed half a cycle (e.g., half cycle of 50Hz is 10ms)
-      if (pulse_width > 0 && pulse_width < 10000) {
-        component->pulse_width_us_ = pulse_width;
-        component->pulse_count_++;  // Complete pulse count
-      }
-    }
+    // Clear PCNT count to restart from 0
+    pcnt_unit_clear_count(unit);
     
-    // 2. Optional: Turn off relay on falling edge (synchronized with pulse)
-    // gpio_set_level(component->relay_output_gpio_num_, 0);
+    // Start one-shot timer (will fire after 2000us)
+    gptimer_set_raw_count(component->delay_timer_, 0);  // Reset timer count to 0
+    gptimer_start(component->delay_timer_);             // Start timer
   }
   
-  // ========================================
-  // Optional feature: Fixed pulse width output
-  // ========================================
-  // If fixed-width pulse output to GPIO4 is needed, delay after rising edge then turn off
-  // Example: 100us fixed pulse width
-  // if (gpio_level == 1) {
-  //   ets_delay_us(100);
-  //   gpio_set_level(component->relay_output_gpio_num_, 0);
-  // }
+  // Return false: no need to wake higher priority task
+  return false;
+}
+
+// ========================================
+// GPTimer Alarm Interrupt Callback (ISR Context)
+// Triggered 2000us after PCNT interrupt
+// Performs the actual GPIO control based on pending_gpio_level_
+// Must use IRAM_ATTR to ensure execution in IRAM
+// ========================================
+bool IRAM_ATTR ZeroCrossRelayComponent::timer_alarm_callback(gptimer_handle_t timer,
+                                                             const gptimer_alarm_event_data_t *edata,
+                                                             void *user_ctx) {
+  ZeroCrossRelayComponent *component = static_cast<ZeroCrossRelayComponent *>(user_ctx);
+  
+  // Stop timer (one-shot mode)
+  gptimer_stop(timer);
+  
+  // Execute delayed GPIO control
+  if (component->pending_gpio_level_ >= 0) {
+    gpio_set_level(component->relay_output_gpio_num_, component->pending_gpio_level_);
+    component->pending_gpio_level_ = -1;  // Clear pending state
+  }
+  
+  // Return false: no need to wake higher priority task
+  return false;
 }
 
 }  // namespace zero_cross_relay
