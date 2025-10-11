@@ -29,6 +29,7 @@
 #include "driver/gpio.h"
 #include "driver/pulse_cnt.h"    // PCNT driver for edge counting
 #include "driver/gptimer.h"      // GPTimer for precise delay
+#include "esp_err.h"
 #include "esp_timer.h"
 
 namespace esphome {
@@ -54,30 +55,28 @@ class ZeroCrossRelayComponent : public Component {
 
   /**
    * @brief 设置占空比翻转点（控制相位/功率）
-   * @param flip_point GPIO翻转点（拉低时机），范围1-19
+   * @param flip_point GPIO翻转点（拉低时机），范围0-20
+   *                   - 0  = 0% 占空比（始终关闭）
    *                   - 1  = 5% 占空比（最小功率）
    *                   - 10 = 50% 占空比（默认，半功率）
    *                   - 19 = 95% 占空比（最大功率）
+   *                   - 20 = 100% 占空比（始终开启）
    * 
    * @note 翻转点越小，导通时间越短，功率越小
    *       翻转点越大，导通时间越长，功率越大
    *       占空比 = flip_point / 20.0
    */
-  void set_duty_cycle_flip_point(int flip_point) {
-    if (flip_point >= 1 && flip_point <= 19) {
-      this->duty_cycle_flip_point_ = flip_point;
-    }
-  }
+  void set_duty_cycle_flip_point(int flip_point);
 
   /**
    * @brief 获取当前占空比翻转点
-   * @return int 当前翻转点（1-19）
+   * @return int 当前翻转点（0-20）
    */
   int get_duty_cycle_flip_point() const { return this->duty_cycle_flip_point_; }
 
   /**
    * @brief 获取当前占空比百分比
-   * @return float 占空比百分比（5.0% - 95.0%）
+   * @return float 占空比百分比（0.0% - 100.0%）
    */
   float get_duty_cycle_percentage() const { return (this->duty_cycle_flip_point_ / 20.0f) * 100.0f; }
 
@@ -125,8 +124,11 @@ class ZeroCrossRelayComponent : public Component {
   // GPIO控制状态（用于定时器中断中判断应该设置高电平还是低电平）
   volatile int pending_gpio_level_{-1};        ///< 待设置的GPIO电平（0=LOW, 1=HIGH, -1=无待处理）
   
-  // 占空比控制（可配置翻转点，范围：1-19）
-  volatile int duty_cycle_flip_point_{10};     ///< GPIO翻转点（拉低时机），范围1-19，默认10（50%占空比）
+  // 占空比控制（可配置翻转点，范围：0-20）
+  volatile int duty_cycle_flip_point_{10};     ///< GPIO翻转点（拉低时机），范围0-20，默认10（50%占空比）
+  volatile int pending_duty_cycle_flip_point_{-1};  ///< 待应用的翻转点请求（0-20，-1表示无）
+  volatile esp_err_t last_watch_point_update_err_{ESP_OK}; ///< 最近一次watch point更新结果
+  volatile bool watch_point_update_event_{false}; ///< 标记是否有watch point更新结果待日志输出
   
   gpio_num_t zero_cross_gpio_num_;             ///< Zero-cross detection GPIO number (ESP-IDF format)
   gpio_num_t relay_output_gpio_num_;           ///< Relay output GPIO number (ESP-IDF format)
