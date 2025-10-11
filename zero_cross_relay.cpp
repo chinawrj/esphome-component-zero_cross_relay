@@ -165,13 +165,14 @@ void ZeroCrossRelayComponent::setup() {
   ESP_LOGI(TAG, "✓ PCNT channel created (GPIO%d: rising↑ +1, falling↓ hold)", this->zero_cross_gpio_num_);
 
   // ========================================
-  // Step 6: Add Watch Points (10 and 20)
+  // Step 6: Add Watch Points (configurable flip point and 20)
   // ========================================
-  ESP_LOGI(TAG, "Step 6: Adding watch points (%d and %d)...", PCNT_WATCH_POINT_HALF, PCNT_HIGH_LIMIT);
+  int flip_point = this->duty_cycle_flip_point_;  // Read current duty cycle setting
+  ESP_LOGI(TAG, "Step 6: Adding watch points (%d and %d)...", flip_point, PCNT_HIGH_LIMIT);
   
-  err = pcnt_unit_add_watch_point(this->pcnt_unit_, PCNT_WATCH_POINT_HALF);
+  err = pcnt_unit_add_watch_point(this->pcnt_unit_, flip_point);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "❌ Failed to add watch point %d: %s", PCNT_WATCH_POINT_HALF, esp_err_to_name(err));
+    ESP_LOGE(TAG, "❌ Failed to add watch point %d: %s", flip_point, esp_err_to_name(err));
     this->mark_failed();
     return;
   }
@@ -182,8 +183,8 @@ void ZeroCrossRelayComponent::setup() {
     this->mark_failed();
     return;
   }
-  ESP_LOGI(TAG, "✓ Watch points added: %d (GPIO4→LOW), %d (GPIO4→HIGH+clear)", 
-           PCNT_WATCH_POINT_HALF, PCNT_HIGH_LIMIT);
+  ESP_LOGI(TAG, "✓ Watch points added: %d (GPIO4→LOW, duty=%.1f%%), %d (GPIO4→HIGH+clear)", 
+           flip_point, (flip_point / 20.0f) * 100.0f, PCNT_HIGH_LIMIT);
 
   // ========================================
   // Step 7: Register Event Callback
@@ -295,8 +296,10 @@ void ZeroCrossRelayComponent::setup() {
   ESP_LOGI(TAG, "   ├─ Output: GPIO%d (controlled via delayed timer)", this->relay_output_gpio_num_);
   ESP_LOGI(TAG, "   ├─ Count range: %d-%d (auto-clear at %d)", 
            PCNT_LOW_LIMIT, PCNT_HIGH_LIMIT, PCNT_HIGH_LIMIT);
+  ESP_LOGI(TAG, "   ├─ Duty cycle: %.1f%% (flip point=%d, range: 1-19)", 
+           (this->duty_cycle_flip_point_ / 20.0f) * 100.0f, this->duty_cycle_flip_point_);
   ESP_LOGI(TAG, "   ├─ Watch point 1: Count=%d → Start timer → %dus → GPIO4 LOW", 
-           PCNT_WATCH_POINT_HALF, TIMER_DELAY_US);
+           this->duty_cycle_flip_point_, TIMER_DELAY_US);
   ESP_LOGI(TAG, "   └─ Watch point 2: Count=%d → Start timer → %dus → GPIO4 HIGH + clear", 
            PCNT_HIGH_LIMIT, TIMER_DELAY_US);
 }
@@ -342,6 +345,8 @@ void ZeroCrossRelayComponent::loop() {
       
       ESP_LOGI(TAG, "📊 PCNT Zero-Cross Statistics:");
       ESP_LOGI(TAG, "   ├─ Current count: %d / %d", pcnt_count, PCNT_HIGH_LIMIT);
+      ESP_LOGI(TAG, "   ├─ Duty cycle: %.1f%% (flip point: %d)", 
+               (this->duty_cycle_flip_point_ / 20.0f) * 100.0f, this->duty_cycle_flip_point_);
       ESP_LOGI(TAG, "   ├─ Total watch point triggers: %u", total_triggers);
       ESP_LOGI(TAG, "   ├─ Complete cycles (20-count): %u", total_cycles);
       if (cycle_time_ms > 0) {
@@ -355,14 +360,18 @@ void ZeroCrossRelayComponent::loop() {
 }
 
 void ZeroCrossRelayComponent::dump_config() {
-  ESP_LOGCONFIG(TAG, "Zero Cross Detection Relay (PCNT Mode):");
+  ESP_LOGCONFIG(TAG, "Zero Cross Detection Relay (PCNT + GPTimer Mode):");
   ESP_LOGCONFIG(TAG, "  Zero-cross input: GPIO%d (PCNT edge counting)", this->zero_cross_gpio_num_);
-  ESP_LOGCONFIG(TAG, "  Relay output: GPIO%d (controlled by PCNT watch points)", this->relay_output_gpio_num_);
+  ESP_LOGCONFIG(TAG, "  Relay output: GPIO%d (controlled by GPTimer delayed)", this->relay_output_gpio_num_);
   ESP_LOGCONFIG(TAG, "  Count range: %d - %d (auto-clear at %d)", 
                 PCNT_LOW_LIMIT, PCNT_HIGH_LIMIT, PCNT_HIGH_LIMIT);
-  ESP_LOGCONFIG(TAG, "  Watch points:");
+  ESP_LOGCONFIG(TAG, "  Duty cycle control:");
+  ESP_LOGCONFIG(TAG, "    ├─ Current duty cycle: %.1f%% (flip point: %d)", 
+                (this->duty_cycle_flip_point_ / 20.0f) * 100.0f, this->duty_cycle_flip_point_);
+  ESP_LOGCONFIG(TAG, "    └─ Adjustable range: 5%% - 95%% (flip point: 1-19)");
+  ESP_LOGCONFIG(TAG, "  Watch points (with %dus delay):", TIMER_DELAY_US);
   ESP_LOGCONFIG(TAG, "    ├─ Point 1: Count=%d → GPIO%d LOW (relay off)", 
-                PCNT_WATCH_POINT_HALF, this->relay_output_gpio_num_);
+                this->duty_cycle_flip_point_, this->relay_output_gpio_num_);
   ESP_LOGCONFIG(TAG, "    └─ Point 2: Count=%d → GPIO%d HIGH (relay on) + clear count", 
                 PCNT_HIGH_LIMIT, this->relay_output_gpio_num_);
   ESP_LOGCONFIG(TAG, "  Edge action: Rising edge +1, Falling edge HOLD");
@@ -385,9 +394,10 @@ bool IRAM_ATTR ZeroCrossRelayComponent::pcnt_on_reach_callback(pcnt_unit_handle_
   // Increment total trigger counter
   component->trigger_count_++;
   
-  if (watch_point_value == PCNT_WATCH_POINT_HALF) {
+  // Check if this is the duty cycle flip point (dynamic value, not fixed at 10)
+  if (watch_point_value == component->duty_cycle_flip_point_) {
     // ========================================
-    // Watch Point 1: Count = 10
+    // Watch Point 1: Count = duty_cycle_flip_point (1-19, configurable)
     // Set pending GPIO level to LOW, then start timer
     // ========================================
     component->pending_gpio_level_ = 0;  // Prepare to set GPIO LOW

@@ -53,6 +53,35 @@ class ZeroCrossRelayComponent : public Component {
   void set_relay_output_pin(InternalGPIOPin *pin) { relay_output_pin_ = pin; }
 
   /**
+   * @brief 设置占空比翻转点（控制相位/功率）
+   * @param flip_point GPIO翻转点（拉低时机），范围1-19
+   *                   - 1  = 5% 占空比（最小功率）
+   *                   - 10 = 50% 占空比（默认，半功率）
+   *                   - 19 = 95% 占空比（最大功率）
+   * 
+   * @note 翻转点越小，导通时间越短，功率越小
+   *       翻转点越大，导通时间越长，功率越大
+   *       占空比 = flip_point / 20.0
+   */
+  void set_duty_cycle_flip_point(int flip_point) {
+    if (flip_point >= 1 && flip_point <= 19) {
+      this->duty_cycle_flip_point_ = flip_point;
+    }
+  }
+
+  /**
+   * @brief 获取当前占空比翻转点
+   * @return int 当前翻转点（1-19）
+   */
+  int get_duty_cycle_flip_point() const { return this->duty_cycle_flip_point_; }
+
+  /**
+   * @brief 获取当前占空比百分比
+   * @return float 占空比百分比（5.0% - 95.0%）
+   */
+  float get_duty_cycle_percentage() const { return (this->duty_cycle_flip_point_ / 20.0f) * 100.0f; }
+
+  /**
    * @brief 组件初始化（setup阶段）
    * 
    * 配置GPIO引脚并注册中断服务例程
@@ -88,13 +117,16 @@ class ZeroCrossRelayComponent : public Component {
   // GPTimer (Hardware Timer) 相关 - 用于延时控制
   gptimer_handle_t delay_timer_{nullptr};      ///< GPTimer句柄（用于2000us延时）
   
-  volatile uint32_t trigger_count_{0};         ///< PCNT watch point触发计数器（10和20的总次数）
+  volatile uint32_t trigger_count_{0};         ///< PCNT watch point触发计数器（翻转点和20的总次数）
   volatile uint32_t cycle_count_{0};           ///< 完整周期计数器（20次/周期）
   volatile uint32_t last_cycle_time_{0};       ///< 上次周期完成时间戳（us）
   float estimated_frequency_{0.0f};            ///< 估算AC频率（Hz）- 基于20次计数周期
   
   // GPIO控制状态（用于定时器中断中判断应该设置高电平还是低电平）
   volatile int pending_gpio_level_{-1};        ///< 待设置的GPIO电平（0=LOW, 1=HIGH, -1=无待处理）
+  
+  // 占空比控制（可配置翻转点，范围：1-19）
+  volatile int duty_cycle_flip_point_{10};     ///< GPIO翻转点（拉低时机），范围1-19，默认10（50%占空比）
   
   gpio_num_t zero_cross_gpio_num_;             ///< Zero-cross detection GPIO number (ESP-IDF format)
   gpio_num_t relay_output_gpio_num_;           ///< Relay output GPIO number (ESP-IDF format)
