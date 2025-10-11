@@ -1,13 +1,13 @@
 """
-ESPHome 过零检测固态继电器组件 (Zero-Cross Detection Solid State Relay)
+ESPHome Zero-Cross Detection Solid State Relay Component
 
-功能说明：
-- 监测GPIO3的过零检测信号（高电平有效）
-- 在过零点时输出控制信号到GPIO4（固态继电器）
-- 提供中断计数、频率统计等监控功能
+Features:
+- Monitors GPIO3 zero-cross detection signal (active HIGH)
+- Outputs control signal to GPIO4 at zero-crossing points (solid state relay)
+- Provides interrupt counting, frequency statistics and monitoring capabilities
 
-作者：GitHub Copilot
-日期：2025-10-10
+Author: GitHub Copilot
+Date: 2025-10-10
 """
 
 import esphome.codegen as cg
@@ -21,17 +21,17 @@ from esphome.const import (
     STATE_CLASS_MEASUREMENT,
 )
 
-# 定义命名空间
+# Define namespace
 zero_cross_relay_ns = cg.esphome_ns.namespace("zero_cross_relay")
 ZeroCrossRelayComponent = zero_cross_relay_ns.class_(
     "ZeroCrossRelayComponent", cg.Component
 )
 
-# 配置键定义
+# Configuration key definitions
 CONF_ZERO_CROSS_PIN = "zero_cross_pin"
 CONF_RELAY_OUTPUT_PIN = "relay_output_pin"
 
-# 组件配置架构
+# Component configuration schema
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(ZeroCrossRelayComponent),
@@ -42,14 +42,14 @@ CONFIG_SCHEMA = cv.Schema(
 
 
 async def to_code(config):
-    """生成C++代码"""
+    """Generate C++ code"""
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
-    # 配置过零检测输入引脚
+    # Configure zero-cross detection input pin
     zero_cross_pin = await cg.gpio_pin_expression(config[CONF_ZERO_CROSS_PIN])
     cg.add(var.set_zero_cross_pin(zero_cross_pin))
 
-    # 配置继电器输出引脚
+    # Configure relay output pin
     relay_pin = await cg.gpio_pin_expression(config[CONF_RELAY_OUTPUT_PIN])
     cg.add(var.set_relay_output_pin(relay_pin))

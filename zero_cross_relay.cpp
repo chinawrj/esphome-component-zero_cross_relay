@@ -15,7 +15,7 @@
 #include "zero_cross_relay.h"
 #include "esphome/core/log.h"
 
-// ESP-IDF系统头文件
+// ESP-IDF system headers
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 

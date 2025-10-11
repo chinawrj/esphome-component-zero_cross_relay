@@ -1,19 +1,19 @@
 /**
  * @file zero_cross_relay.h
- * @brief 过零检测固态继电器组件头文件（ESP-IDF PCNT + CPU中断版本）
+ * @brief Zero-Cross Detection Solid State Relay Component Header (ESP-IDF PCNT + CPU Interrupt Version)
  * 
- * 功能：
- * - 使用PCNT硬件计数器监测AC电源的过零点（GPIO3输入）
- * - 计数范围：0-20，自动循环清零
- * - Watch Point：计数到10时拉低GPIO4，计数到20时拉高GPIO4
- * - 提供中断触发计数和频率统计
- * - 使用PCNT Watch Point中断实现精确相位控制
+ * Features:
+ * - Uses PCNT hardware counter to monitor AC power zero-crossing points (GPIO3 input)
+ * - Count range: 0-20, auto-clear when reaches 20
+ * - Watch Point: Pull GPIO4 LOW at count 10, pull GPIO4 HIGH at count 20
+ * - Provides interrupt trigger counting and frequency statistics
+ * - Uses PCNT Watch Point interrupt for precise phase control
  * 
- * 硬件连接：
- * - GPIO3: 过零检测输入（上升沿计数，内部上拉）
- * - GPIO4: 固态继电器输出（初始高电平，计数10时拉低，计数20时拉高）
+ * Hardware Connections:
+ * - GPIO3: Zero-cross detection input (rising edge count, internal pull-up)
+ * - GPIO4: Solid state relay output (initial HIGH, LOW at count 10, HIGH at count 20)
  * 
- * @note 此实现仅兼容ESP-IDF框架（ESP32-C6）
+ * @note This implementation is only compatible with ESP-IDF framework (ESP32-C6)
  * 
  * @author chinawrj@gmail.com
  * @date 2025-10-11
@@ -37,127 +37,127 @@ namespace zero_cross_relay {
 
 /**
  * @class ZeroCrossRelayComponent
- * @brief 过零检测固态继电器组件类
+ * @brief Zero-Cross Detection Solid State Relay Component Class
  */
 class ZeroCrossRelayComponent : public Component {
  public:
   /**
-   * @brief 设置过零检测输入引脚
-   * @param pin GPIO引脚对象指针
+   * @brief Set zero-cross detection input pin
+   * @param pin GPIO pin object pointer
    */
   void set_zero_cross_pin(InternalGPIOPin *pin) { zero_cross_pin_ = pin; }
 
   /**
-   * @brief 设置继电器输出引脚
-   * @param pin GPIO引脚对象指针
+   * @brief Set relay output pin
+   * @param pin GPIO pin object pointer
    */
   void set_relay_output_pin(InternalGPIOPin *pin) { relay_output_pin_ = pin; }
 
   /**
-   * @brief 设置占空比翻转点（控制相位/功率）
-   * @param flip_point GPIO翻转点（拉低时机），范围0-20
-   *                   - 0  = 0% 占空比（始终关闭）
-   *                   - 1  = 5% 占空比（最小功率）
-   *                   - 10 = 50% 占空比（默认，半功率）
-   *                   - 19 = 95% 占空比（最大功率）
-   *                   - 20 = 100% 占空比（始终开启）
+   * @brief Set duty cycle flip point (controls phase/power)
+   * @param flip_point GPIO flip point (when to pull LOW), range 0-20
+   *                   - 0  = 0% duty cycle (always off)
+   *                   - 1  = 5% duty cycle (minimum power)
+   *                   - 10 = 50% duty cycle (default, half power)
+   *                   - 19 = 95% duty cycle (maximum power)
+   *                   - 20 = 100% duty cycle (always on)
    * 
-   * @note 翻转点越小，导通时间越短，功率越小
-   *       翻转点越大，导通时间越长，功率越大
-   *       占空比 = flip_point / 20.0
+   * @note Lower flip point = shorter on-time = lower power
+   *       Higher flip point = longer on-time = higher power
+   *       Duty cycle = flip_point / 20.0
    */
   void set_duty_cycle_flip_point(int flip_point);
 
   /**
-   * @brief 获取当前占空比翻转点
-   * @return int 当前翻转点（0-20）
+   * @brief Get current duty cycle flip point
+   * @return int Current flip point (0-20)
    */
   int get_duty_cycle_flip_point() const { return this->duty_cycle_flip_point_; }
 
   /**
-   * @brief 获取当前占空比百分比
-   * @return float 占空比百分比（0.0% - 100.0%）
+   * @brief Get current duty cycle percentage
+   * @return float Duty cycle percentage (0.0% - 100.0%)
    */
   float get_duty_cycle_percentage() const { return (this->duty_cycle_flip_point_ / 20.0f) * 100.0f; }
 
   /**
-   * @brief 组件初始化（setup阶段）
+   * @brief Component initialization (setup phase)
    * 
-   * 配置GPIO引脚并注册中断服务例程
+   * Configures GPIO pins and registers interrupt service routines
    */
   void setup() override;
 
   /**
-   * @brief 组件主循环（loop阶段）
+   * @brief Component main loop (loop phase)
    * 
-   * 用于周期性任务（如频率计算）
+   * Used for periodic tasks (such as frequency calculation)
    */
   void loop() override;
 
   /**
-   * @brief 获取组件优先级
-   * @return float 优先级（较高值优先初始化）
+   * @brief Get component priority
+   * @return float Priority (higher value initializes first)
    */
   float get_setup_priority() const override { return setup_priority::IO; }
 
   /**
-   * @brief 输出组件配置信息到日志
+   * @brief Output component configuration information to log
    */
   void dump_config() override;
 
  protected:
-  InternalGPIOPin *zero_cross_pin_{nullptr};   ///< 过零检测输入引脚
-  InternalGPIOPin *relay_output_pin_{nullptr}; ///< 继电器输出引脚
+  InternalGPIOPin *zero_cross_pin_{nullptr};   ///< Zero-cross detection input pin
+  InternalGPIOPin *relay_output_pin_{nullptr}; ///< Relay output pin
 
-  // PCNT (Pulse Counter) 相关
-  pcnt_unit_handle_t pcnt_unit_{nullptr};      ///< PCNT单元句柄（计数0-20，自动循环）
-  pcnt_channel_handle_t pcnt_channel_{nullptr}; ///< PCNT通道句柄（GPIO3上升沿计数）
+  // PCNT (Pulse Counter) related
+  pcnt_unit_handle_t pcnt_unit_{nullptr};      ///< PCNT unit handle (count 0-20, auto-loop)
+  pcnt_channel_handle_t pcnt_channel_{nullptr}; ///< PCNT channel handle (GPIO3 rising edge count)
   
-  // GPTimer (Hardware Timer) 相关 - 用于延时控制
-  gptimer_handle_t delay_timer_{nullptr};      ///< GPTimer句柄（用于2000us延时）
+  // GPTimer (Hardware Timer) related - for delay control
+  gptimer_handle_t delay_timer_{nullptr};      ///< GPTimer handle (for 2000us delay)
   
-  volatile uint32_t trigger_count_{0};         ///< PCNT watch point触发计数器（翻转点和20的总次数）
-  volatile uint32_t cycle_count_{0};           ///< 完整周期计数器（20次/周期）
-  volatile uint32_t last_cycle_time_{0};       ///< 上次周期完成时间戳（us）
-  float estimated_frequency_{0.0f};            ///< 估算AC频率（Hz）- 基于20次计数周期
+  volatile uint32_t trigger_count_{0};         ///< PCNT watch point trigger counter (total count of flip point and 20)
+  volatile uint32_t cycle_count_{0};           ///< Complete cycle counter (20 counts per cycle)
+  volatile uint32_t last_cycle_time_{0};       ///< Last cycle completion timestamp (us)
+  float estimated_frequency_{0.0f};            ///< Estimated AC frequency (Hz) - based on 20-count cycle
   
-  // GPIO控制状态（用于定时器中断中判断应该设置高电平还是低电平）
-  volatile int pending_gpio_level_{-1};        ///< 待设置的GPIO电平（0=LOW, 1=HIGH, -1=无待处理）
+  // GPIO control state (used in timer interrupt to determine HIGH or LOW level)
+  volatile int pending_gpio_level_{-1};        ///< Pending GPIO level to set (0=LOW, 1=HIGH, -1=none)
   
-  // 占空比控制（可配置翻转点，范围：0-20）
-  volatile int duty_cycle_flip_point_{10};     ///< GPIO翻转点（拉低时机），范围0-20，默认10（50%占空比）
-  volatile int pending_duty_cycle_flip_point_{-1};  ///< 待应用的翻转点请求（0-20，-1表示无）
-  volatile esp_err_t last_watch_point_update_err_{ESP_OK}; ///< 最近一次watch point更新结果
-  volatile bool watch_point_update_event_{false}; ///< 标记是否有watch point更新结果待日志输出
+  // Duty cycle control (configurable flip point, range: 0-20)
+  volatile int duty_cycle_flip_point_{10};     ///< GPIO flip point (when to pull LOW), range 0-20, default 10 (50% duty)
+  volatile int pending_duty_cycle_flip_point_{-1};  ///< Pending flip point request (0-20, -1=none)
+  volatile esp_err_t last_watch_point_update_err_{ESP_OK}; ///< Last watch point update result
+  volatile bool watch_point_update_event_{false}; ///< Flag indicating watch point update result pending for log output
   
   gpio_num_t zero_cross_gpio_num_;             ///< Zero-cross detection GPIO number (ESP-IDF format)
   gpio_num_t relay_output_gpio_num_;           ///< Relay output GPIO number (ESP-IDF format)
 
   /**
-   * @brief PCNT Watch Point中断回调函数（ISR上下文）
+   * @brief PCNT Watch Point interrupt callback function (ISR context)
    * 
-   * 当PCNT计数到达Watch Point（10或20）时由硬件触发
-   * 不直接控制GPIO，而是启动硬件定时器延时2000us
+   * Triggered by hardware when PCNT count reaches Watch Point (10 or 20)
+   * Does not directly control GPIO, instead starts hardware timer for 2000us delay
    * 
-   * @param unit PCNT单元句柄
-   * @param edata Watch Point事件数据（包含触发值）
-   * @param user_ctx 用户上下文指针（this指针）
-   * @return bool 是否需要唤醒更高优先级任务
+   * @param unit PCNT unit handle
+   * @param edata Watch Point event data (contains trigger value)
+   * @param user_ctx User context pointer (this pointer)
+   * @return bool Whether to wake higher priority task
    */
   static bool IRAM_ATTR pcnt_on_reach_callback(pcnt_unit_handle_t unit,
                                                 const pcnt_watch_event_data_t *edata,
                                                 void *user_ctx);
 
   /**
-   * @brief GPTimer报警中断回调函数（ISR上下文）
+   * @brief GPTimer alarm interrupt callback function (ISR context)
    * 
-   * 在PCNT中断触发后延时2000us执行
-   * 根据pending_gpio_level_的值控制GPIO4电平
+   * Executes 2000us after PCNT interrupt is triggered
+   * Controls GPIO4 level according to pending_gpio_level_ value
    * 
-   * @param timer GPTimer句柄
-   * @param edata 报警事件数据
-   * @param user_ctx 用户上下文指针（this指针）
-   * @return bool 是否需要唤醒更高优先级任务
+   * @param timer GPTimer handle
+   * @param edata Alarm event data
+   * @param user_ctx User context pointer (this pointer)
+   * @return bool Whether to wake higher priority task
    */
   static bool IRAM_ATTR timer_alarm_callback(gptimer_handle_t timer,
                                               const gptimer_alarm_event_data_t *edata,
