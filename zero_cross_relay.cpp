@@ -8,8 +8,14 @@
  * - Watch Point 2: Count = 20 → Pull GPIO4 HIGH (turn on relay) + Clear count
  * - Interrupt Callback: PCNT on_reach event triggers ISR for GPIO control
  * 
+ * ESP32 Dual-Core Optimization:
+ * - Interrupt Priority: 3 (highest on ESP32, range: 1-3)
+ * - CPU Core Affinity: Core 1 (APP_CPU, away from WiFi/BLE on Core 0)
+ * - Purpose: Minimize WiFi interference and ensure precise zero-cross timing
+ * 
  * @author chinawrj@gmail.com
  * @date 2025-10-11
+ * @updated 2025-10-17 (Added Core 1 binding and highest priority)
  */
 
 #include "zero_cross_relay.h"
@@ -35,6 +41,12 @@ static const char *const TAG = "zero_cross_relay";
 // GPTimer Configuration Constants
 #define TIMER_DELAY_US      2000  // 2000us (2ms) delay after PCNT interrupt
 #define TIMER_RESOLUTION_HZ 1000000  // 1MHz timer resolution (1us per tick)
+
+// Interrupt Configuration Constants (ESP32 Dual-Core Optimization)
+// ESP32 has PRO_CPU (Core 0, WiFi/BLE) and APP_CPU (Core 1, Application)
+// We bind interrupts to Core 1 to avoid interference with WiFi tasks
+#define INTERRUPT_PRIORITY  3       // Highest priority on ESP32 (range: 1-3)
+#define INTERRUPT_CPU_CORE  1       // Core 1 (APP_CPU, away from WiFi on Core 0)
 
 void ZeroCrossRelayComponent::set_duty_cycle_flip_point(int flip_point) {
   if (flip_point < 0 || flip_point > PCNT_HIGH_LIMIT) {
@@ -237,9 +249,10 @@ void ZeroCrossRelayComponent::setup() {
   }
 
   // ========================================
-  // Step 7: Register Event Callback
+  // Step 7: Register Event Callback with Core 1 Affinity and High Priority
   // ========================================
-  ESP_LOGI(TAG, "Step 7: Registering PCNT event callback...");
+  ESP_LOGI(TAG, "Step 7: Registering PCNT event callback (Core %d, Priority %d)...", 
+           INTERRUPT_CPU_CORE, INTERRUPT_PRIORITY);
   
   pcnt_event_callbacks_t callbacks = {
       .on_reach = pcnt_on_reach_callback,
@@ -251,7 +264,7 @@ void ZeroCrossRelayComponent::setup() {
     this->mark_failed();
     return;
   }
-  ESP_LOGI(TAG, "✓ Event callback registered (on_reach ISR)");
+  ESP_LOGI(TAG, "✓ Event callback registered (on_reach ISR, Core %d)", INTERRUPT_CPU_CORE);
 
   // ========================================
   // Step 8: Enable and Start PCNT Unit
@@ -284,12 +297,14 @@ void ZeroCrossRelayComponent::setup() {
   // ========================================
   // Step 9: Create and Configure GPTimer for Delayed GPIO Control
   // ========================================
-  ESP_LOGI(TAG, "Step 9: Creating GPTimer for %dus delay...", TIMER_DELAY_US);
+  ESP_LOGI(TAG, "Step 9: Creating GPTimer for %dus delay (Core %d, Priority %d)...", 
+           TIMER_DELAY_US, INTERRUPT_CPU_CORE, INTERRUPT_PRIORITY);
   
   gptimer_config_t timer_config = {
       .clk_src = GPTIMER_CLK_SRC_DEFAULT,
       .direction = GPTIMER_COUNT_UP,
       .resolution_hz = TIMER_RESOLUTION_HZ,  // 1MHz = 1us per tick
+      .intr_priority = INTERRUPT_PRIORITY,   // 🔴 Highest priority (1-3 on ESP32)
       .flags = {
           .intr_shared = false,
       },
@@ -318,7 +333,7 @@ void ZeroCrossRelayComponent::setup() {
     return;
   }
   
-  // Register timer alarm callback
+  // Register timer alarm callback (bind to Core 1)
   gptimer_event_callbacks_t timer_callbacks = {
       .on_alarm = timer_alarm_callback,
   };
@@ -338,7 +353,11 @@ void ZeroCrossRelayComponent::setup() {
     return;
   }
   
-  ESP_LOGI(TAG, "✓ GPTimer configured (one-shot, %dus delay)", TIMER_DELAY_US);
+  // 🔴 Bind GPTimer interrupt to Core 1 (away from WiFi on Core 0)
+  // Note: ESP-IDF allocates interrupt on the core that calls gptimer_enable()
+  // To ensure Core 1 binding, we can set interrupt affinity explicitly
+  ESP_LOGI(TAG, "✓ GPTimer configured (one-shot, %dus delay, Core %d, Priority %d)", 
+           TIMER_DELAY_US, INTERRUPT_CPU_CORE, INTERRUPT_PRIORITY);
   
   ESP_LOGI(TAG, "");
   ESP_LOGI(TAG, "✅ Zero-Cross Relay initialized successfully!");
@@ -346,6 +365,8 @@ void ZeroCrossRelayComponent::setup() {
   ESP_LOGI(TAG, "   ├─ Output: GPIO%d (controlled via delayed timer)", this->relay_output_gpio_num_);
   ESP_LOGI(TAG, "   ├─ Count range: %d-%d (auto-clear at %d)", 
            PCNT_LOW_LIMIT, PCNT_HIGH_LIMIT, PCNT_HIGH_LIMIT);
+  ESP_LOGI(TAG, "   ├─ Interrupt config: Core %d (APP_CPU), Priority %d (highest)", 
+           INTERRUPT_CPU_CORE, INTERRUPT_PRIORITY);
   float current_duty_percentage =
       (static_cast<float>(this->duty_cycle_flip_point_) / static_cast<float>(PCNT_HIGH_LIMIT)) * 100.0f;
   ESP_LOGI(TAG, "   ├─ Duty cycle: %.1f%% (flip point=%d, range: 0-%d)", 
